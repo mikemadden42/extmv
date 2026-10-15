@@ -134,6 +134,24 @@ if [[ -n "$otherfs" ]]; then
         no "EXDEV: mode not masked by umask (got: $mode)"
     fi
 
+    # Cross-fs move from a source whose files can't be deleted: refused
+    # without leaving a copy behind, so a rerun doesn't report "already exists".
+    src="$work/xdev-ro"
+    if [[ $(id -u) -ne 0 ]]; then
+        mkdir -p "$src/in"
+        printf 'ro\n' > "$src/in/a.txt"
+        chmod 555 "$src/in"
+        "$EXTMV" "$src/in" "$dst" >/dev/null 2>"$src/err"; rc=$?
+        chmod 755 "$src/in"
+        [[ $rc == 1 ]] && ok "EXDEV read-only source exits 1" || no "EXDEV read-only source exits 1"
+        grep -q "^extmv: cannot move '$src/in/a.txt'" "$src/err" \
+            && ok "EXDEV read-only source reported" || no "EXDEV read-only source reported"
+        assert_file   "$src/in/a.txt"  "EXDEV read-only source keeps file"
+        assert_absent "$dst/txt/a.txt" "EXDEV read-only source leaves no copy"
+    else
+        skip "EXDEV read-only source (running as root)"
+    fi
+
     # Interrupt a cross-fs copy. Whenever the signal lands, the real name must
     # be absent or complete -- never truncated -- and the data must survive.
     # (512 MiB so the copy is usually still running when the signal lands.)
@@ -243,6 +261,8 @@ if [[ -w /dev/full ]]; then
     grep -q "^extmv: error writing to stdout" "$src/err" \
         && ok "/dev/full reported" || no "/dev/full reported"
     assert_file "$src/Documents/txt/a.txt" "/dev/full still moves files"
+    "$EXTMV" --help >/dev/full 2>/dev/null \
+        && no "--help to /dev/full fails" || ok "--help to /dev/full fails"
 else
     skip "stdout write error (/dev/full not available)"
 fi
@@ -282,6 +302,15 @@ mkdir -p "$src/Documents/txt"
 ( cd "$src"; touch a.txt b.txt Documents/txt/b.txt; "$EXTMV" >out )
 [[ "$(cat "$src/out")" == $'Moved a.txt to Documents/txt\nFile b.txt already exists in Documents/txt' ]] \
     && ok "stdout messages exact and sorted" || no "stdout messages exact and sorted (got: $(cat "$src/out"))"
+
+# --- stdout and stderr stay in processing order ---
+src="$work/order"
+mkdir -p "$src/Documents"
+( cd "$src"; touch a.md b.txt c.md Documents/txt; "$EXTMV" >out 2>&1 )
+expected=$'Moved a.md to Documents/md\nextmv: cannot create \'Documents/txt\': '
+[[ "$(head -c ${#expected} "$src/out")" == "$expected" && "$(sed -n 3p "$src/out")" == "Moved c.md to Documents/md" ]] \
+    && ok "stdout and stderr interleave in order" \
+    || no "stdout and stderr interleave in order (got: $(cat "$src/out"))"
 
 echo
 echo "passed: $pass, failed: $fail"

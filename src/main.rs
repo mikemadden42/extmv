@@ -19,7 +19,7 @@
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, FileTimes, Metadata, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -122,9 +122,10 @@ fn report(parts: &[&[u8]]) {
     let _ = io::stderr().write_all(&msg);
 }
 
-/// Buffered stdout that remembers whether any write failed. After the first
-/// failure it stops writing but the run continues, so a closed pipe never
-/// leaves files half-organized.
+/// Stdout (line-buffered by Rust, so lines appear as files are processed and
+/// stay in order with stderr) that remembers whether any write failed. After
+/// the first failure it stops writing but the run continues, so a closed pipe
+/// never leaves files half-organized.
 struct Out<W: Write> {
     w: W,
     failed: bool,
@@ -234,9 +235,37 @@ fn process<W: Write>(name: &OsStr, source: &OsStr, dest_base: &OsStr, out: &mut 
 /// `AlreadyExists` if `dst` appeared.
 fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
     match rename_noclobber(src, dst) {
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => copy_then_delete(src, dst),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            // Linux reports EXDEV before checking permissions, so a source
+            // that can't be deleted would otherwise be copied in full only
+            // for the copy to be undone.
+            check_removable(src)?;
+            copy_then_delete(src, dst)
+        }
         r => r,
     }
+}
+
+/// Best-effort early check that `src` could be unlinked: its directory must
+/// be writable and searchable, and in a sticky directory we must own the file
+/// or the directory. `copy_then_delete` copes if this is wrong.
+fn check_removable(src: &Path) -> io::Result<()> {
+    let dir = match src.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let c = cstring(dir)?;
+    if unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::W_OK | libc::X_OK, libc::AT_EACCESS) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir_meta = fs::metadata(dir)?;
+    if dir_meta.mode() & 0o1000 != 0 {
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 && euid != dir_meta.uid() && euid != fs::symlink_metadata(src)?.uid() {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+    }
+    Ok(())
 }
 
 /// Same-filesystem rename that fails with `AlreadyExists` rather than
@@ -310,9 +339,9 @@ fn source_changed() -> io::Error {
 /// beside `dst`, fsynced, renamed (no-clobber) into place, and the directory
 /// fsynced before the source is deleted. So `dst` only ever appears complete
 /// and durable: an interrupted run leaves at most a stray `.extmv-*` file,
-/// never a truncated file under the real name. Any failure before the source
-/// delete leaves the source intact and no `dst`; a failed source delete keeps
-/// both copies.
+/// never a truncated file under the real name. Any failure leaves the source
+/// intact and no `dst`, except when the source path no longer names the file
+/// that was copied: then the copy is kept, as it may be the only one.
 fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
     // The entry was a regular file when checked, but may have been swapped
     // since. Don't follow a symlink and don't block on a FIFO.
@@ -329,10 +358,13 @@ fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
     // dst always has a parent: process() builds it as join(dest_dir, name).
     let dir = dst.parent().unwrap_or(Path::new("."));
     let (tmp, output) = create_temp(dir)?;
-    if let Err(e) = copy_contents(&mut input, output, &meta).and_then(|()| rename_noclobber(&tmp, dst)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let placed = match write_temp(&mut input, output, &meta, &tmp, dst) {
+        Ok(placed) => placed,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
 
     // Make the new directory entry durable before the source goes away;
     // otherwise a crash could lose the file on both filesystems.
@@ -344,11 +376,35 @@ fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
     // Only delete src if it still names the file that was copied; otherwise
     // keep both. (Narrows, but can't close, the window: there is no
     // "unlink if inode matches".)
+    let still = |path: &Path, want: &Metadata| fs::symlink_metadata(path).is_ok_and(|m| same_file(&m, want));
     match fs::symlink_metadata(src) {
-        Ok(now) if now.dev() == meta.dev() && now.ino() == meta.ino() => fs::remove_file(src),
-        Ok(_) => Err(source_changed()),
-        Err(e) => Err(e),
+        Ok(now) if same_file(&now, &meta) => {}
+        Ok(_) => return Err(source_changed()),
+        Err(e) => return Err(e),
     }
+    if let Err(e) = fs::remove_file(src) {
+        // The source survived, so the copy is redundant: undo it so the
+        // failed move changes nothing -- but only while both paths still name
+        // the files involved.
+        if still(src, &meta) && still(dst, &placed) {
+            let _ = fs::remove_file(dst);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn same_file(a: &Metadata, b: &Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Fill the temporary file and rename it to `dst`. Returns the metadata of
+/// the placed file.
+fn write_temp(input: &mut File, output: File, meta: &Metadata, tmp: &Path, dst: &Path) -> io::Result<Metadata> {
+    let placed = output.metadata()?;
+    copy_contents(input, output, meta)?;
+    rename_noclobber(tmp, dst)?;
+    Ok(placed)
 }
 
 /// Exclusively create a hidden temporary file in `dir`. The name doesn't
@@ -401,7 +457,7 @@ fn run(source: &OsStr, dest_base: &OsStr) -> bool {
         return false;
     };
 
-    let mut out = Out { w: BufWriter::new(io::stdout().lock()), failed: false };
+    let mut out = Out { w: io::stdout().lock(), failed: false };
     let mut ok = true;
     for name in &names {
         ok &= process(name, source, dest_base, &mut out);
@@ -417,7 +473,11 @@ fn run(source: &OsStr, dest_base: &OsStr) -> bool {
 fn main() -> ExitCode {
     match parse_args(std::env::args_os().skip(1)) {
         Cli::Help => {
-            let _ = io::stdout().write_all(USAGE.as_bytes());
+            let mut stdout = io::stdout();
+            if stdout.write_all(USAGE.as_bytes()).and_then(|()| stdout.flush()).is_err() {
+                report(&[b"error writing to stdout"]);
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Cli::Usage(msg) => {
@@ -590,6 +650,41 @@ mod tests {
         let (tmp, _) = create_temp(&t.0).unwrap();
         assert_ne!(tmp, stale);
         assert!(tmp.file_name().unwrap().as_bytes().starts_with(b".extmv-"));
+    }
+
+    #[test]
+    fn copy_undone_when_source_cannot_be_deleted() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can delete regardless of permissions
+        }
+        let t = TempDir::new("copy-undo");
+        fs::create_dir(t.0.join("in")).unwrap();
+        fs::create_dir(t.0.join("out")).unwrap();
+        let (src, dst) = (t.0.join("in/a.txt"), t.0.join("out/a.txt"));
+        fs::write(&src, "data").unwrap();
+        fs::set_permissions(t.0.join("in"), fs::Permissions::from_mode(0o555)).unwrap();
+        // Bypasses check_removable, so the copy happens and must be undone.
+        let r = copy_then_delete(&src, &dst);
+        fs::set_permissions(t.0.join("in"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "data");
+        assert_eq!(entries(&t.0.join("out")), [] as [OsString; 0]);
+    }
+
+    #[test]
+    fn check_removable_rejects_read_only_dir() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = TempDir::new("removable");
+        fs::create_dir(t.0.join("in")).unwrap();
+        let src = t.0.join("in/a.txt");
+        fs::write(&src, "").unwrap();
+        check_removable(&src).unwrap();
+        fs::set_permissions(t.0.join("in"), fs::Permissions::from_mode(0o555)).unwrap();
+        let r = check_removable(&src);
+        fs::set_permissions(t.0.join("in"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

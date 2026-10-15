@@ -1,10 +1,12 @@
 # extmv — Behavioral Specification
 
-Version: 1.1 (2026-10-15). 1.0 was derived from `vacuum.c` (C17, repo
-`mikemadden42/vacuum`) at commit `1988a1a`. 1.1 records the choices this Rust
+Version: 1.2 (2026-10-15). 1.0 was derived from `vacuum.c` (C17, repo
+`mikemadden42/vacuum`) at commit `1988a1a`. 1.1 recorded the choices this Rust
 implementation made where 1.0 left room (`--`, sort order, no-clobber moves,
-SIGPIPE), the hardened cross-filesystem move (§3.6), and the test suite as it
-now stands (§7).
+SIGPIPE), the hardened cross-filesystem move (§3.6), and the test suite (§7).
+1.2: a cross-filesystem move whose source can't be deleted no longer leaves a
+second copy (§3.6); stdout is line-buffered so it stays in order with stderr
+(§3.7, §4); help output reports write failures (§2.1, §3.7).
 
 `extmv` is the new name for this tool. The C reference implementation is still
 called `vacuum`; mentions of `vacuum` or "the C version" below refer to it.
@@ -57,7 +59,8 @@ Arguments are scanned left to right; the first rule that matches wins. Rules
 1–3 apply only until `--` has been seen.
 
 1. Arg is exactly `-h` or `--help` → print usage to **stdout**, exit **0**
-   immediately (no files touched).
+   immediately (no files touched). If that write fails → stderr
+   `extmv: error writing to stdout`, exit **1**. **(extmv)**
 2. Arg is exactly `--` → end of options; skip it. Every later argument is a
    positional, even `-h` or `-foo`. **(extmv)**
 3. Arg starts with `-` and is longer than one character → print
@@ -209,6 +212,15 @@ C version, which wrote straight to `dest_path` and didn't fsync; an
 interrupted copy there leaves a truncated file under the real name that a
 rerun reports as "already exists" with exit 0. **(extmv)**
 
+**Check the source can be deleted first.** Linux reports EXDEV before it
+checks permissions, so a rename from a read-only directory reaches this
+fallback. Before copying, extmv checks (`faccessat(W_OK|X_OK, AT_EACCESS)`)
+that the source's directory is writable and searchable, and, if that
+directory is sticky, that it owns the file or the directory (or is root). If
+not, the move fails with `Permission denied` / `Operation not permitted`
+without copying anything. The check can be wrong (ACLs, races); step 10 is
+the backstop. **(extmv)**
+
 1. **Open the source** read-only with `O_NOFOLLOW | O_NONBLOCK`, `fstat` it,
    and require a regular file. The entry passed §3.2 when it was checked but
    may have been swapped since: a symlink is not followed and a FIFO doesn't
@@ -238,11 +250,16 @@ rerun reports as "already exists" with exit 0. **(extmv)**
    `source changed during move`. A replacement made between this check and
    the `unlink` would still be deleted; POSIX has no "unlink if inode
    matches", so the window can only be narrowed.
-10. If deleting the source fails, `dest_path` is **kept** (both copies now
-    exist) and the move is reported as failed.
+10. If deleting the source fails, the source is still there, so the copy is
+    redundant: `dest_path` is removed again, provided `src_path` and
+    `dest_path` still have the device and inode of the original and the copy.
+    The move is reported as failed and nothing has changed. **(extmv)** 1.0
+    (like the C version) kept both copies, after which a rerun reported
+    "already exists" with exit 0.
 
-On any failure in steps 1–7 the source is left intact, and a temporary that
-was created is removed. If the process is killed mid-copy, at most a stray
+On any failure the source is left intact and no `dest_path` or temporary
+remains — except in step 9, where the source path no longer names the copied
+file and the copy is kept, as it may be the only one. If the process is killed mid-copy, at most a stray
 `.extmv-<pid>-<n>.tmp` remains in `dest_dir`; it is safe to delete.
 
 Not preserved: setuid/setgid/sticky, owner/group, xattrs, ACLs, hard-link
@@ -256,14 +273,18 @@ After all entries:
   `extmv > /dev/full`) → stderr `extmv: error writing to stdout`, mark failed.
 - Exit **1** if any failure was marked, else **0**.
 
+**Buffering (extmv).** stdout is line-buffered (Rust's default for stdout,
+even into a pipe or file), so each line is written as its file is processed
+and stays in order with stderr lines, which are unbuffered.
+
 **SIGPIPE (extmv).** The C version is killed silently by SIGPIPE on
 `vacuum | head`, which can stop it mid-run with files left unsorted. extmv
 ignores SIGPIPE (the Rust default): after the first failed write it stops
 writing to stdout, finishes processing every file, then reports
 `error writing to stdout` and exits 1.
 
-Help output (`-h`/`--help`) is written without checking for errors and always
-exits 0.
+Help output (`-h`/`--help`) is checked the same way: a failed write prints
+`extmv: error writing to stdout` and exits 1.
 
 Out-of-memory is fatal (C aborts with exit 1); extmv leaves it to the Rust
 runtime.
@@ -292,8 +313,8 @@ It doesn't have to match byte-for-byte across languages, and tests should only
 match the prefix. Names, paths and arguments are printed raw (no quoting or
 escaping).
 
-stdout is buffered; stderr is not. When both go to a terminal, an error line
-can therefore appear before "Moved" lines for files processed earlier.
+Lines appear in processing order across both streams (§3.7), so
+`extmv >log 2>&1` gives a faithful log.
 
 Exit codes: `0` success, `1` any failure. (The test script uses `2` for
 "binary not found"; that's the test harness, not the tool.)
@@ -324,8 +345,8 @@ Exit codes: `0` success, `1` any failure. (The test script uses `2` for
 7. **Reject empty path arguments** (see §3.4).
 8. **Check stdout errors at exit.** Many runtimes swallow them (Rust
    `println!` panics on EPIPE instead; Go's `fmt.Println` ignores errors).
-   Use an explicit buffered writer and check flush. Decide on SIGPIPE; extmv's
-   choice is in §3.7.
+   Check every write and the final flush. Decide on buffering and SIGPIPE;
+   extmv's choices are in §3.7.
 9. **Snapshot first.** Collect the listing into a `Vec`/slice/list before
    moving anything, and treat a mid-listing read error as fatal.
 10. **Never write a partial file under the real name** in the cross-filesystem
@@ -381,7 +402,9 @@ parts the shell can't reach (§7.3).
 | Filename with invalid UTF-8 bytes, `$'\xff.txt'`         | moved to `txt/`                                            |
 | `Documents/txt` is a regular file                        | exit 1, `cannot create` or `cannot access` on stderr, other files still moved |
 | Read-only source dir (rename gets EACCES)                | exit 1, one `cannot move` line per file, files kept        |
+| Read-only source dir, dest on another filesystem         | exit 1, `cannot move`, file kept, **no copy left at the destination** |
 | `extmv > /dev/full`                                      | exit 1, `error writing to stdout`, files still moved       |
+| `extmv --help > /dev/full`                               | exit ≠ 0                                                   |
 | `extmv . ""` / `extmv "" x`                              | exit 1, usage on stderr, nothing moved                     |
 | `extmv -- -dir out`                                      | `-dir` used as `source_dir`                                |
 | `extmv - out`                                            | lone `-` used as `source_dir`                              |
@@ -389,6 +412,7 @@ parts the shell can't reach (§7.3).
 | `a.txt` + `b.txt` with `Documents/txt/b.txt` existing    | stdout exactly `Moved a.txt …` then `File b.txt already exists …` (sorted) |
 | Cross-fs, `0666` source under `umask 022`                | arrives as `0666` (§3.6 step 3)                            |
 | Cross-fs, 512 MiB file, SIGTERM mid-copy                 | `dest_path` absent (source intact) or complete; never truncated |
+| `a.md`, `b.txt`, `c.md` with `Documents/txt` a file, `2>&1` | `Moved a.md …`, then `cannot create …`, then `Moved c.md …` (in order) |
 
 The interrupt case can't fail because of timing: whenever the signal lands,
 the result must be one of the two allowed states. The file is large so the
@@ -399,17 +423,19 @@ Cases skip themselves where they can't run: the cross-filesystem cases when no
 writable directory on a second filesystem is found (`/dev/shm`,
 `/run/user/<uid>`, `/Volumes/RAMDisk`, `$TMPDIR`), the non-UTF-8 name on
 filesystems that reject it (APFS), `/dev/full` where it doesn't exist, and
-the read-only case when run as root. On macOS CI the first three skip.
+the read-only cases when run as root. On macOS CI the first three skip.
 
 ### 7.3 Unit tests
 
 Cases that need a race or a contrived file type the shell can't arrange
 reliably are tested by calling the internals directly: argument parsing
 (§2.1), the extension and join rules (§3.3, §3.4), the link-then-unlink
-fallback (moves; refuses an existing destination), and the copy (exact mode
-despite umask, refuses a symlink or FIFO source without blocking, leaves no
-temporary behind, refuses an existing destination and cleans up, skips stale
-temporary names).
+fallback (moves; refuses an existing destination), the source-deletable check
+(rejects a read-only directory), and the copy (exact mode despite umask,
+refuses a symlink or FIFO source without blocking, leaves no temporary behind,
+refuses an existing destination and cleans up, skips stale temporary names,
+and undoes itself when the source can't be deleted — called directly, so the
+up-front check doesn't stop it first).
 
 Not covered by any test: a source replaced mid-copy (§3.6 step 9), a copy
 failing partway (e.g. `ENOSPC`), a failed directory fsync, and the

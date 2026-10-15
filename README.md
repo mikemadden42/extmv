@@ -34,6 +34,10 @@ extmv -h | --help
 - The cross-filesystem copy keeps the rwx permission bits (exactly, regardless
   of umask) and timestamps; setuid/setgid/sticky, ownership, xattrs and ACLs
   are not preserved.
+- If a cross-filesystem move can't delete the source (e.g. a read-only
+  directory), it fails without leaving a copy behind.
+- Existing bucket directories are used as found, including symlinks, so
+  avoid running extmv into a destination other users can write to.
 - Exit status is 0 on success, 1 if anything failed.
 
 Differences from the C version: files are processed in sorted order, empty
