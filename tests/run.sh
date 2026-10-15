@@ -133,6 +133,29 @@ if [[ -n "$otherfs" ]]; then
     else
         no "EXDEV: mode not masked by umask (got: $mode)"
     fi
+
+    # Interrupt a cross-fs copy. Whenever the signal lands, the real name must
+    # be absent or complete -- never truncated -- and the data must survive.
+    # (512 MiB so the copy is usually still running when the signal lands.)
+    src="$work/xdev-int"
+    mkdir -p "$src"
+    head -c 536870912 /dev/urandom > "$src/big.bin"
+    sum=$(cksum < "$src/big.bin")
+    "$EXTMV" "$src" "$dst" >/dev/null 2>&1 &
+    pid=$!
+    sleep 0.05
+    # TERM, not INT: non-interactive bash starts background jobs ignoring SIGINT.
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    if [[ -e "$dst/bin/big.bin" ]]; then
+        [[ "$(cksum < "$dst/bin/big.bin")" == "$sum" ]] \
+            && ok "EXDEV interrupted: destination complete" \
+            || no "EXDEV interrupted: destination truncated"
+    else
+        [[ "$(cksum < "$src/big.bin" 2>/dev/null)" == "$sum" ]] \
+            && ok "EXDEV interrupted: no destination, source intact" \
+            || no "EXDEV interrupted: no destination and source damaged"
+    fi
     rm -rf "$dst"
 else
     skip "EXDEV cross-filesystem move (no second filesystem available)"

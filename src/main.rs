@@ -1,7 +1,7 @@
 //! extmv: move each regular file in a directory into `<dest_base>/<ext>/`.
 //!
 //! Rust port of the C `vacuum`/`extmv` tool; see the behavioral spec for the
-//! exact contract. Differences from the C version, all sanctioned by the spec:
+//! exact contract. Differences from the C version:
 //!
 //! - entries are processed in bytewise-sorted order;
 //! - empty `source_dir`/`dest_base` arguments are rejected;
@@ -9,9 +9,13 @@
 //! - the move is no-clobber (`renameat2(RENAME_NOREPLACE)` on Linux,
 //!   `renamex_np(RENAME_EXCL)` on macOS, else `link` + `unlink`), closing the
 //!   check-then-rename race;
-//! - the cross-filesystem fallback sets the exact rwx mode (ignoring umask),
-//!   preserves atime/mtime, fsyncs the copy before deleting the source, and
-//!   refuses to delete a source path that no longer names the copied file.
+//! - the cross-filesystem fallback copies via a hidden temporary file renamed
+//!   into place (so an interrupted copy never leaves a truncated file under
+//!   the real name), fsyncs the file and its directory before deleting the
+//!   source, preserves atime/mtime, and refuses to delete a source path that
+//!   no longer names the copied file;
+//! - the copy gets the exact rwx mode, ignoring umask (spec §3.6 has umask
+//!   apply; this follows `mv` instead).
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, FileTimes, Metadata, OpenOptions};
@@ -229,14 +233,19 @@ fn process<W: Write>(name: &OsStr, source: &OsStr, dest_base: &OsStr, out: &mut 
 /// Move without ever replacing an existing destination. Fails with
 /// `AlreadyExists` if `dst` appeared.
 fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
-    let renamed = match rename_noreplace(src, dst) {
+    match rename_noclobber(src, dst) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => copy_then_delete(src, dst),
+        r => r,
+    }
+}
+
+/// Same-filesystem rename that fails with `AlreadyExists` rather than
+/// replacing `dst`.
+fn rename_noclobber(src: &Path, dst: &Path) -> io::Result<()> {
+    match rename_noreplace(src, dst) {
         // The filesystem (or OS) can't do a no-clobber rename. Never fall back
         // to a plain rename: it would overwrite a dst created since the check.
         Err(e) if is_unsupported(&e) => link_then_unlink(src, dst),
-        r => r,
-    };
-    match renamed {
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => copy_then_delete(src, dst),
         r => r,
     }
 }
@@ -297,9 +306,13 @@ fn source_changed() -> io::Error {
     io::Error::other("source changed during move")
 }
 
-/// Cross-filesystem move: exclusive-create the destination, copy, fsync,
-/// close, then delete the source. A failed copy removes the partial
-/// destination; a failed source delete keeps both copies.
+/// Cross-filesystem move. The copy is written to a hidden temporary file
+/// beside `dst`, fsynced, renamed (no-clobber) into place, and the directory
+/// fsynced before the source is deleted. So `dst` only ever appears complete
+/// and durable: an interrupted run leaves at most a stray `.extmv-*` file,
+/// never a truncated file under the real name. Any failure before the source
+/// delete leaves the source intact and no `dst`; a failed source delete keeps
+/// both copies.
 fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
     // The entry was a regular file when checked, but may have been swapped
     // since. Don't follow a symlink and don't block on a FIFO.
@@ -313,8 +326,17 @@ fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
         return Err(source_changed());
     }
 
-    let output = OpenOptions::new().write(true).create_new(true).mode(0o600).open(dst)?;
-    if let Err(e) = copy_contents(&mut input, output, &meta) {
+    // dst always has a parent: process() builds it as join(dest_dir, name).
+    let dir = dst.parent().unwrap_or(Path::new("."));
+    let (tmp, output) = create_temp(dir)?;
+    if let Err(e) = copy_contents(&mut input, output, &meta).and_then(|()| rename_noclobber(&tmp, dst)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Make the new directory entry durable before the source goes away;
+    // otherwise a crash could lose the file on both filesystems.
+    if let Err(e) = sync_dir(dir) {
         let _ = fs::remove_file(dst);
         return Err(e);
     }
@@ -326,6 +348,31 @@ fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
         Ok(now) if now.dev() == meta.dev() && now.ino() == meta.ino() => fs::remove_file(src),
         Ok(_) => Err(source_changed()),
         Err(e) => Err(e),
+    }
+}
+
+/// Exclusively create a hidden temporary file in `dir`. The name doesn't
+/// embed the file's own name, which could push it past `NAME_MAX`.
+fn create_temp(dir: &Path) -> io::Result<(std::path::PathBuf, File)> {
+    let pid = std::process::id();
+    let mut n = 0u32;
+    loop {
+        let tmp = dir.join(format!(".extmv-{pid}-{n}.tmp"));
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            // A stray from an earlier, interrupted run with the same pid.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// fsync a directory. Filesystems that can't sync directories (some FUSE or
+/// network ones) are tolerated: there is nothing more to be done there.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match File::open(dir).and_then(|d| d.sync_all()) {
+        Err(e) if is_unsupported(&e) => Ok(()),
+        r => r,
     }
 }
 
@@ -502,6 +549,47 @@ mod tests {
         assert!(!src.exists());
         assert_eq!(fs::read_to_string(&dst).unwrap(), "data");
         assert_eq!(fs::metadata(&dst).unwrap().permissions().mode() & 0o7777, 0o666);
+    }
+
+    fn entries(dir: &Path) -> Vec<OsString> {
+        let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn copy_leaves_no_temp_file() {
+        let t = TempDir::new("copy-clean");
+        fs::create_dir(t.0.join("out")).unwrap();
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("out/a.txt"));
+        fs::write(&src, "data").unwrap();
+        copy_then_delete(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "data");
+        assert_eq!(entries(&t.0.join("out")), ["a.txt"]);
+    }
+
+    #[test]
+    fn copy_never_overwrites_and_cleans_up() {
+        let t = TempDir::new("copy-exists");
+        fs::create_dir(t.0.join("out")).unwrap();
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("out/a.txt"));
+        fs::write(&src, "new").unwrap();
+        fs::write(&dst, "keep").unwrap();
+        let e = copy_then_delete(&src, &dst).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "keep");
+        assert_eq!(entries(&t.0.join("out")), ["a.txt"]);
+    }
+
+    #[test]
+    fn create_temp_skips_stale_names() {
+        let t = TempDir::new("temp-stale");
+        let stale = t.0.join(format!(".extmv-{}-0.tmp", std::process::id()));
+        fs::write(&stale, "").unwrap();
+        let (tmp, _) = create_temp(&t.0).unwrap();
+        assert_ne!(tmp, stale);
+        assert!(tmp.file_name().unwrap().as_bytes().starts_with(b".extmv-"));
     }
 
     #[test]

@@ -26,9 +26,13 @@ extmv -h | --help
 - The extension is whatever follows the last `.` (`archive.tar.gz` → `gz`),
   case preserved. Names with no `.` or a trailing `.` are skipped.
 - If the destination already exists the file is left alone and reported.
-- Moves across filesystems fall back to copy + fsync + delete. The copy keeps
-  the rwx permission bits (exactly, regardless of umask) and timestamps;
-  setuid/setgid/sticky, ownership, xattrs and ACLs are not preserved.
+- Moves across filesystems copy to a hidden `.extmv-*.tmp` file, fsync it,
+  rename it into place, fsync the directory, then delete the source, so an
+  interrupted move never leaves a truncated file under the real name. A
+  leftover `.extmv-*.tmp` from an interrupted run is safe to delete.
+- The cross-filesystem copy keeps the rwx permission bits (exactly, regardless
+  of umask) and timestamps; setuid/setgid/sticky, ownership, xattrs and ACLs
+  are not preserved.
 - Exit status is 0 on success, 1 if anything failed.
 
 Differences from the C version: files are processed in sorted order, empty
