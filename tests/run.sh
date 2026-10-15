@@ -166,11 +166,16 @@ mkdir -p "$src/dir.d"
 assert_absent "$src/Documents/d" "subdirectory not bucketed"
 
 # --- non-UTF-8 file name ---
+# Some filesystems (APFS) refuse such names outright; nothing to test there.
 src="$work/bytes"
 mkdir -p "$src"
-( cd "$src"; touch $'\xff.txt'; "$EXTMV" >/dev/null )
-assert_file   "$src/Documents/txt/"$'\xff.txt' "non-UTF-8 name moved"
-assert_absent "$src/"$'\xff.txt'              "non-UTF-8 source removed"
+if touch "$src/"$'\xff.txt' 2>/dev/null; then
+    ( cd "$src"; "$EXTMV" >/dev/null )
+    assert_file   "$src/Documents/txt/"$'\xff.txt' "non-UTF-8 name moved"
+    assert_absent "$src/"$'\xff.txt'              "non-UTF-8 source removed"
+else
+    skip "non-UTF-8 file name (filesystem rejects it)"
+fi
 
 # --- bucket path blocked by a regular file: error, but the run continues ---
 src="$work/blocked"

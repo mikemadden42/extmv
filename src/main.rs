@@ -186,11 +186,7 @@ fn process<W: Write>(name: &OsStr, source: &OsStr, dest_base: &OsStr, out: &mut 
     let dest_dir = join(dest_base.as_bytes(), ext);
     let dest_path = join(dest_dir.as_bytes(), n);
 
-    if let Err(e) = fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o777)
-        .create(&dest_dir)
-    {
+    if let Err(e) = fs::DirBuilder::new().recursive(true).mode(0o777).create(&dest_dir) {
         report(&[b"cannot create '", dest_dir.as_bytes(), b"': ", &reason(&e)]);
         return false;
     }
@@ -206,12 +202,7 @@ fn process<W: Write>(name: &OsStr, source: &OsStr, dest_base: &OsStr, out: &mut 
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => {
-            report(&[
-                b"cannot access '",
-                dest_path.as_bytes(),
-                b"': ",
-                &reason(&e),
-            ]);
+            report(&[b"cannot access '", dest_path.as_bytes(), b"': ", &reason(&e)]);
             return false;
         }
     }
@@ -227,14 +218,7 @@ fn process<W: Write>(name: &OsStr, source: &OsStr, dest_base: &OsStr, out: &mut 
             true
         }
         Err(e) => {
-            report(&[
-                b"cannot move '",
-                src_path.as_bytes(),
-                b"' to '",
-                dest_path.as_bytes(),
-                b"': ",
-                &reason(&e),
-            ]);
+            report(&[b"cannot move '", src_path.as_bytes(), b"' to '", dest_path.as_bytes(), b"': ", &reason(&e)]);
             false
         }
     }
@@ -280,22 +264,14 @@ fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 #[cfg(target_os = "macos")]
 fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     let (src, dst) = (cstring(src)?, cstring(dst)?);
     let r = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), libc::RENAME_EXCL) };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -309,11 +285,7 @@ fn rename_noreplace(_src: &Path, _dst: &Path) -> io::Result<()> {
 fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
     let mut input = File::open(src)?;
     let meta = input.metadata()?;
-    let output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(meta.permissions().mode() & 0o777)
-        .open(dst)?;
+    let output = OpenOptions::new().write(true).create_new(true).mode(meta.permissions().mode() & 0o777).open(dst)?;
 
     if let Err(e) = copy_contents(&mut input, output, &meta) {
         let _ = fs::remove_file(dst);
@@ -336,11 +308,7 @@ fn copy_contents(input: &mut File, mut output: File, meta: &Metadata) -> io::Res
 /// Close explicitly so the error is seen; dropping a `File` discards it.
 fn close(file: File) -> io::Result<()> {
     let fd = file.into_raw_fd();
-    if unsafe { libc::close(fd) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    if unsafe { libc::close(fd) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 fn run(source: &OsStr, dest_base: &OsStr) -> bool {
@@ -348,10 +316,7 @@ fn run(source: &OsStr, dest_base: &OsStr) -> bool {
         return false;
     };
 
-    let mut out = Out {
-        w: BufWriter::new(io::stdout().lock()),
-        failed: false,
-    };
+    let mut out = Out { w: BufWriter::new(io::stdout().lock()), failed: false };
     let mut ok = true;
     for name in &names {
         ok &= process(name, source, dest_base, &mut out);
@@ -394,10 +359,7 @@ mod tests {
     }
 
     fn run_cli(source: &str, dest_base: &str) -> Cli {
-        Cli::Run {
-            source: source.into(),
-            dest_base: dest_base.into(),
-        }
+        Cli::Run { source: source.into(), dest_base: dest_base.into() }
     }
 
     #[test]
@@ -430,40 +392,22 @@ mod tests {
     fn first_decisive_arg_wins() {
         assert_eq!(parse_args(args(&["-h", "a", "b", "c"])), Cli::Help);
         assert_eq!(parse_args(args(&["a", "--help"])), Cli::Help);
-        assert_eq!(
-            parse_args(args(&["a", "b", "c", "-h"])),
-            Cli::Usage(b"too many arguments".to_vec())
-        );
-        assert_eq!(
-            parse_args(args(&["--bogus", "-h"])),
-            Cli::Usage(b"unknown option '--bogus'".to_vec())
-        );
+        assert_eq!(parse_args(args(&["a", "b", "c", "-h"])), Cli::Usage(b"too many arguments".to_vec()));
+        assert_eq!(parse_args(args(&["--bogus", "-h"])), Cli::Usage(b"unknown option '--bogus'".to_vec()));
     }
 
     #[test]
     fn empty_args_rejected() {
-        assert_eq!(
-            parse_args(args(&[".", ""])),
-            Cli::Usage(b"empty path argument".to_vec())
-        );
-        assert_eq!(
-            parse_args(args(&["", "x"])),
-            Cli::Usage(b"empty path argument".to_vec())
-        );
+        assert_eq!(parse_args(args(&[".", ""])), Cli::Usage(b"empty path argument".to_vec()));
+        assert_eq!(parse_args(args(&["", "x"])), Cli::Usage(b"empty path argument".to_vec()));
     }
 
     #[test]
     fn double_dash_ends_options() {
         assert_eq!(parse_args(args(&["--"])), run_cli(".", "Documents"));
-        assert_eq!(
-            parse_args(args(&["--", "-dir"])),
-            run_cli("-dir", "Documents")
-        );
+        assert_eq!(parse_args(args(&["--", "-dir"])), run_cli("-dir", "Documents"));
         assert_eq!(parse_args(args(&["--", "-h"])), run_cli("-h", "Documents"));
-        assert_eq!(
-            parse_args(args(&["--", "a", "b", "c"])),
-            Cli::Usage(b"too many arguments".to_vec())
-        );
+        assert_eq!(parse_args(args(&["--", "a", "b", "c"])), Cli::Usage(b"too many arguments".to_vec()));
     }
 
     #[test]
