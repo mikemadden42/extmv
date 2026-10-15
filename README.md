@@ -11,8 +11,9 @@ its extension:
 ./photo.jpg    ->  Documents/jpg/photo.jpg
 ```
 
-Rust port of the C `vacuum` tool. It is non-recursive and never overwrites.
-The full behavior contract is in [docs/spec.md](docs/spec.md).
+Rust port of [`vacuum`](https://github.com/mikemadden42/vacuum). It is
+non-recursive and never overwrites. The full behavior contract is in
+[docs/spec.md](docs/spec.md).
 
 ## Usage
 
@@ -49,7 +50,7 @@ supports neither, the move fails with an error instead.
 
 ## Build and test
 
-```
+```sh
 cargo build --release
 cargo test                         # unit tests + tests/run.sh
 ./tests/run.sh target/release/extmv
