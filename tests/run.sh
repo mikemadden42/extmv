@@ -115,7 +115,8 @@ if [[ -n "$otherfs" ]]; then
     dst=$(mktemp -d "$otherfs/extmv.XXXXXX")
     mkdir -p "$src"
     ( cd "$src"; printf 'payload\n' > move.bin; chmod 640 move.bin
-      "$EXTMV" . "$dst" >/dev/null )
+      touch shared.dat; chmod 666 shared.dat
+      umask 022; "$EXTMV" . "$dst" >/dev/null )
     assert_file "$dst/bin/move.bin"          "EXDEV: file copied to other fs"
     assert_absent "$src/move.bin"            "EXDEV: source removed"
     [[ "$(cat "$dst/bin/move.bin" 2>/dev/null)" == "payload" ]] \
@@ -125,6 +126,12 @@ if [[ -n "$otherfs" ]]; then
         ok "EXDEV: permissions preserved"
     else
         no "EXDEV: permissions preserved (got: $mode)"
+    fi
+    mode=$(stat_mode "$dst/dat/shared.dat")
+    if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode == 8#666 )); then
+        ok "EXDEV: mode not masked by umask"
+    else
+        no "EXDEV: mode not masked by umask (got: $mode)"
     fi
     rm -rf "$dst"
 else

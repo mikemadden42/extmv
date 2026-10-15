@@ -7,16 +7,18 @@
 //! - empty `source_dir`/`dest_base` arguments are rejected;
 //! - `--` ends option parsing;
 //! - the move is no-clobber (`renameat2(RENAME_NOREPLACE)` on Linux,
-//!   `renamex_np(RENAME_EXCL)` on macOS), closing the check-then-rename race;
-//! - the cross-filesystem fallback preserves atime/mtime and fsyncs the copy
-//!   before deleting the source.
+//!   `renamex_np(RENAME_EXCL)` on macOS, else `link` + `unlink`), closing the
+//!   check-then-rename race;
+//! - the cross-filesystem fallback sets the exact rwx mode (ignoring umask),
+//!   preserves atime/mtime, fsyncs the copy before deleting the source, and
+//!   refuses to delete a source path that no longer names the copied file.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, FileTimes, Metadata, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -228,10 +230,9 @@ fn process<W: Write>(name: &OsStr, source: &OsStr, dest_base: &OsStr, out: &mut 
 /// `AlreadyExists` if `dst` appeared.
 fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
     let renamed = match rename_noreplace(src, dst) {
-        // The filesystem (or OS) can't do a no-clobber rename. Fall back to a
-        // plain rename; the existence check just before this narrows, but
-        // can't close, the window in which a new dst would be overwritten.
-        Err(e) if is_unsupported(&e) => fs::rename(src, dst),
+        // The filesystem (or OS) can't do a no-clobber rename. Never fall back
+        // to a plain rename: it would overwrite a dst created since the check.
+        Err(e) if is_unsupported(&e) => link_then_unlink(src, dst),
         r => r,
     };
     match renamed {
@@ -279,22 +280,59 @@ fn rename_noreplace(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOSYS))
 }
 
+/// Portable no-clobber move: `link` fails with `EEXIST` atomically. A
+/// filesystem without hard links makes this fail too, which is reported as an
+/// error rather than risking an overwrite.
+fn link_then_unlink(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::hard_link(src, dst)?;
+    if let Err(e) = fs::remove_file(src) {
+        // dst is the same inode as src, so dropping it loses nothing.
+        let _ = fs::remove_file(dst);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn source_changed() -> io::Error {
+    io::Error::other("source changed during move")
+}
+
 /// Cross-filesystem move: exclusive-create the destination, copy, fsync,
 /// close, then delete the source. A failed copy removes the partial
 /// destination; a failed source delete keeps both copies.
 fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
-    let mut input = File::open(src)?;
+    // The entry was a regular file when checked, but may have been swapped
+    // since. Don't follow a symlink and don't block on a FIFO.
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)
+        .map_err(|e| if e.raw_os_error() == Some(libc::ELOOP) { source_changed() } else { e })?;
     let meta = input.metadata()?;
-    let output = OpenOptions::new().write(true).create_new(true).mode(meta.permissions().mode() & 0o777).open(dst)?;
+    if !meta.is_file() {
+        return Err(source_changed());
+    }
 
+    let output = OpenOptions::new().write(true).create_new(true).mode(0o600).open(dst)?;
     if let Err(e) = copy_contents(&mut input, output, &meta) {
         let _ = fs::remove_file(dst);
         return Err(e);
     }
-    fs::remove_file(src)
+
+    // Only delete src if it still names the file that was copied; otherwise
+    // keep both. (Narrows, but can't close, the window: there is no
+    // "unlink if inode matches".)
+    match fs::symlink_metadata(src) {
+        Ok(now) if now.dev() == meta.dev() && now.ino() == meta.ino() => fs::remove_file(src),
+        Ok(_) => Err(source_changed()),
+        Err(e) => Err(e),
+    }
 }
 
 fn copy_contents(input: &mut File, mut output: File, meta: &Metadata) -> io::Result<()> {
+    // Set the mode explicitly so umask doesn't alter it; setuid/setgid/sticky
+    // are dropped on purpose.
+    output.set_permissions(fs::Permissions::from_mode(meta.permissions().mode() & 0o777))?;
     io::copy(input, &mut output)?;
     // Timestamps are best-effort; failing to set them is not worth failing
     // (and undoing) the move.
@@ -408,6 +446,86 @@ mod tests {
         assert_eq!(parse_args(args(&["--", "-dir"])), run_cli("-dir", "Documents"));
         assert_eq!(parse_args(args(&["--", "-h"])), run_cli("-h", "Documents"));
         assert_eq!(parse_args(args(&["--", "a", "b", "c"])), Cli::Usage(b"too many arguments".to_vec()));
+    }
+
+    /// A fresh scratch directory, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("extmv-test-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn link_then_unlink_moves() {
+        let t = TempDir::new("link-ok");
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("b.txt"));
+        fs::write(&src, "data").unwrap();
+        link_then_unlink(&src, &dst).unwrap();
+        assert!(!src.exists());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "data");
+    }
+
+    #[test]
+    fn link_then_unlink_never_overwrites() {
+        let t = TempDir::new("link-exists");
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("b.txt"));
+        fs::write(&src, "new").unwrap();
+        fs::write(&dst, "keep").unwrap();
+        let e = link_then_unlink(&src, &dst).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "keep");
+    }
+
+    #[test]
+    fn copy_sets_exact_mode_despite_umask() {
+        let t = TempDir::new("copy-mode");
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("b.txt"));
+        fs::write(&src, "data").unwrap();
+        // 0o4666: setuid must be dropped; group/other write must survive umask.
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o4666)).unwrap();
+        let old = unsafe { libc::umask(0o022) };
+        let r = copy_then_delete(&src, &dst);
+        unsafe { libc::umask(old) };
+        r.unwrap();
+        assert!(!src.exists());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "data");
+        assert_eq!(fs::metadata(&dst).unwrap().permissions().mode() & 0o7777, 0o666);
+    }
+
+    #[test]
+    fn copy_refuses_symlink_source() {
+        let t = TempDir::new("copy-symlink");
+        let (target, src, dst) = (t.0.join("target"), t.0.join("a.txt"), t.0.join("b.txt"));
+        fs::write(&target, "data").unwrap();
+        std::os::unix::fs::symlink(&target, &src).unwrap();
+        let e = copy_then_delete(&src, &dst).unwrap_err();
+        assert_eq!(e.to_string(), "source changed during move");
+        assert!(src.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn copy_refuses_fifo_source_without_blocking() {
+        let t = TempDir::new("copy-fifo");
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("b.txt"));
+        let c = CString::new(src.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = copy_then_delete(&src, &dst).unwrap_err();
+        assert_eq!(e.to_string(), "source changed during move");
+        assert!(src.exists());
+        assert!(!dst.exists());
     }
 
     #[test]

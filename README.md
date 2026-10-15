@@ -26,15 +26,17 @@ extmv -h | --help
 - The extension is whatever follows the last `.` (`archive.tar.gz` → `gz`),
   case preserved. Names with no `.` or a trailing `.` are skipped.
 - If the destination already exists the file is left alone and reported.
-- Moves across filesystems fall back to copy + fsync + delete, keeping
-  permission bits and timestamps.
+- Moves across filesystems fall back to copy + fsync + delete. The copy keeps
+  the rwx permission bits (exactly, regardless of umask) and timestamps;
+  setuid/setgid/sticky, ownership, xattrs and ACLs are not preserved.
 - Exit status is 0 on success, 1 if anything failed.
 
 Differences from the C version: files are processed in sorted order, empty
 path arguments are rejected, `--` ends options, and the move itself is
 no-clobber (`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)`
-on macOS), so a file that appears at the destination mid-run is never
-overwritten.
+on macOS, `link` + `unlink` where those are unsupported), so a file that
+appears at the destination mid-run is never overwritten. On a filesystem that
+supports neither, the move fails with an error instead.
 
 ## Build and test
 
