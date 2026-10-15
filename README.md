@@ -12,6 +12,7 @@ its extension:
 ```
 
 Rust port of the C `vacuum` tool. It is non-recursive and never overwrites.
+The full behavior contract is in [docs/spec.md](docs/spec.md).
 
 ## Usage
 
