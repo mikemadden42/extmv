@@ -1,5 +1,7 @@
 # extmv
 
+[![CI](https://github.com/mikemadden42/extmv/actions/workflows/ci.yml/badge.svg)](https://github.com/mikemadden42/extmv/actions/workflows/ci.yml)
+
 Tidy a directory by moving each regular file into a subdirectory named after
 its extension:
 
