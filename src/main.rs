@@ -8,7 +8,8 @@
 //! - `--` ends option parsing;
 //! - the move is no-clobber (`renameat2(RENAME_NOREPLACE)` on Linux,
 //!   `renamex_np(RENAME_EXCL)` on macOS, else `link` + `unlink`), closing the
-//!   check-then-rename race;
+//!   check-then-rename race except on filesystems that support neither (e.g.
+//!   exFAT/FAT on macOS), where it falls back to check-then-rename;
 //! - the cross-filesystem fallback copies via a hidden temporary file renamed
 //!   into place (so an interrupted copy never leaves a truncated file under
 //!   the real name), fsyncs the file and its directory before deleting the
@@ -272,8 +273,7 @@ fn check_removable(src: &Path) -> io::Result<()> {
 /// replacing `dst`.
 fn rename_noclobber(src: &Path, dst: &Path) -> io::Result<()> {
     match rename_noreplace(src, dst) {
-        // The filesystem (or OS) can't do a no-clobber rename. Never fall back
-        // to a plain rename: it would overwrite a dst created since the check.
+        // The filesystem (or OS) can't do a no-clobber rename.
         Err(e) if is_unsupported(&e) => link_then_unlink(src, dst),
         r => r,
     }
@@ -318,17 +318,38 @@ fn rename_noreplace(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOSYS))
 }
 
-/// Portable no-clobber move: `link` fails with `EEXIST` atomically. A
-/// filesystem without hard links makes this fail too, which is reported as an
-/// error rather than risking an overwrite.
+/// Portable no-clobber move: `link` fails with `EEXIST` atomically. On a
+/// filesystem without hard links this degrades to `rename_checked`.
 fn link_then_unlink(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::hard_link(src, dst)?;
+    if let Err(e) = fs::hard_link(src, dst) {
+        return if lacks_hard_links(&e) { rename_checked(src, dst) } else { Err(e) };
+    }
     if let Err(e) = fs::remove_file(src) {
         // dst is the same inode as src, so dropping it loses nothing.
         let _ = fs::remove_file(dst);
         return Err(e);
     }
     Ok(())
+}
+
+/// `link` failing because the filesystem can't (or won't) add a link, as
+/// opposed to `dst` existing. Linux vfat says `EPERM`; macOS exFAT/FAT say
+/// `ENOTSUP`.
+fn lacks_hard_links(e: &io::Error) -> bool {
+    let errs = [libc::EPERM, libc::EMLINK, libc::ENOTSUP, libc::EOPNOTSUPP];
+    e.raw_os_error().is_some_and(|n| errs.contains(&n))
+}
+
+/// Last resort where neither a no-clobber rename nor hard links exist (exFAT
+/// and FAT on macOS): check, then plain `rename`. A file created at `dst`
+/// between the two is overwritten; this filesystem offers nothing better, and
+/// refusing would make extmv unusable on most removable drives.
+fn rename_checked(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dst) {
+        Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(src, dst),
+        Err(e) => Err(e),
+    }
 }
 
 fn source_changed() -> io::Error {
@@ -366,17 +387,20 @@ fn copy_then_delete(src: &Path, dst: &Path) -> io::Result<()> {
         }
     };
 
+    let still = |path: &Path, want: &Metadata| fs::symlink_metadata(path).is_ok_and(|m| same_file(&m, want));
+
     // Make the new directory entry durable before the source goes away;
     // otherwise a crash could lose the file on both filesystems.
     if let Err(e) = sync_dir(dir) {
-        let _ = fs::remove_file(dst);
+        if still(dst, &placed) {
+            let _ = fs::remove_file(dst);
+        }
         return Err(e);
     }
 
     // Only delete src if it still names the file that was copied; otherwise
     // keep both. (Narrows, but can't close, the window: there is no
     // "unlink if inode matches".)
-    let still = |path: &Path, want: &Metadata| fs::symlink_metadata(path).is_ok_and(|m| same_file(&m, want));
     match fs::symlink_metadata(src) {
         Ok(now) if same_file(&now, &meta) => {}
         Ok(_) => return Err(source_changed()),
@@ -417,7 +441,13 @@ fn create_temp(dir: &Path) -> io::Result<(std::path::PathBuf, File)> {
         match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
             Ok(file) => return Ok((tmp, file)),
             // A stray from an earlier, interrupted run with the same pid.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if n == 100 {
+                    // Not AlreadyExists: that would read as a dst collision.
+                    return Err(io::Error::other("no free temporary file name"));
+                }
+                n += 1;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -555,15 +585,21 @@ mod tests {
         assert_eq!(parse_args(args(&["--", "a", "b", "c"])), Cli::Usage(b"too many arguments".to_vec()));
     }
 
+    /// Held by every `TempDir`, so filesystem tests run one at a time and a
+    /// test that changes the process-wide umask can't affect another.
+    static FS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A fresh scratch directory, removed on drop.
-    struct TempDir(std::path::PathBuf);
+    struct TempDir(std::path::PathBuf, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
+            // A panicking test poisons the lock; the next one can still go.
+            let guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = std::env::temp_dir().join(format!("extmv-test-{}-{tag}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir(&dir).unwrap();
-            TempDir(dir)
+            TempDir(dir, guard)
         }
     }
 
@@ -593,6 +629,38 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&src).unwrap(), "new");
         assert_eq!(fs::read_to_string(&dst).unwrap(), "keep");
+    }
+
+    #[test]
+    fn rename_checked_moves() {
+        let t = TempDir::new("checked-ok");
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("b.txt"));
+        fs::write(&src, "data").unwrap();
+        rename_checked(&src, &dst).unwrap();
+        assert!(!src.exists());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "data");
+    }
+
+    #[test]
+    fn rename_checked_never_overwrites() {
+        let t = TempDir::new("checked-exists");
+        let (src, dst) = (t.0.join("a.txt"), t.0.join("b.txt"));
+        fs::write(&src, "new").unwrap();
+        std::os::unix::fs::symlink("nowhere", &dst).unwrap();
+        let e = rename_checked(&src, &dst).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "new");
+        assert!(dst.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn create_temp_exhaustion_is_not_already_exists() {
+        let t = TempDir::new("temp-full");
+        for n in 0..=100 {
+            fs::write(t.0.join(format!(".extmv-{}-{n}.tmp", std::process::id())), "").unwrap();
+        }
+        let e = create_temp(&t.0).unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]

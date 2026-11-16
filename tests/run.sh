@@ -4,6 +4,11 @@
 # $EXTMV or the first argument, otherwise it defaults to ../target/release/extmv.
 #
 # Usage: tests/run.sh [path-to-extmv]
+#
+# Environment:
+#   EXTMV_OTHERFS      writable directory on another filesystem for the
+#                      cross-filesystem cases (default: probe a few candidates)
+#   EXTMV_HEAVY_TESTS  set to 1 to run the 512 MiB interrupted-copy case
 
 set -u
 
@@ -104,7 +109,7 @@ fi
 # Needs a writable directory on a different filesystem; /dev/shm is the usual
 # candidate on Linux. Skipped when no second filesystem is available.
 otherfs=""
-for cand in /dev/shm /run/user/"$(id -u)" /Volumes/RAMDisk "${TMPDIR:-}"; do
+for cand in "${EXTMV_OTHERFS:-}" /dev/shm /run/user/"$(id -u)" /Volumes/RAMDisk "${TMPDIR:-}"; do
     [[ -n "$cand" ]] || continue
     if [[ -d "$cand" && -w "$cand" && "$(stat_dev "$cand")" != "$(stat_dev "$work")" ]]; then
         otherfs="$cand"; break
@@ -121,18 +126,43 @@ if [[ -n "$otherfs" ]]; then
     assert_absent "$src/move.bin"            "EXDEV: source removed"
     [[ "$(cat "$dst/bin/move.bin" 2>/dev/null)" == "payload" ]] \
         && ok "EXDEV: content intact" || no "EXDEV: content intact"
-    mode=$(stat_mode "$dst/bin/move.bin")
-    if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode == 8#640 )); then
-        ok "EXDEV: permissions preserved"
+    # exFAT/FAT have no permission bits: chmod "succeeds" but stat reports a
+    # fixed mount-wide mode. Only check modes where they can stick.
+    probe="$dst/.mode-probe"
+    touch "$probe"; chmod 640 "$probe"
+    if [[ "$(stat_mode "$probe")" == 640 ]]; then
+        mode=$(stat_mode "$dst/bin/move.bin")
+        if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode == 8#640 )); then
+            ok "EXDEV: permissions preserved"
+        else
+            no "EXDEV: permissions preserved (got: $mode)"
+        fi
+        mode=$(stat_mode "$dst/dat/shared.dat")
+        if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode == 8#666 )); then
+            ok "EXDEV: mode not masked by umask"
+        else
+            no "EXDEV: mode not masked by umask (got: $mode)"
+        fi
     else
-        no "EXDEV: permissions preserved (got: $mode)"
+        skip "EXDEV permission checks (destination filesystem has no modes)"
     fi
-    mode=$(stat_mode "$dst/dat/shared.dat")
-    if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode == 8#666 )); then
-        ok "EXDEV: mode not masked by umask"
-    else
-        no "EXDEV: mode not masked by umask (got: $mode)"
-    fi
+    rm -f "$probe"
+
+    # Collision on the destination filesystem: never overwritten, even where
+    # the move has to fall back to check-then-rename (exFAT/FAT on macOS).
+    src="$work/xdev-exists"
+    mkdir -p "$src" "$dst/log"
+    printf 'new\n' > "$src/c.log"; printf 'keep\n' > "$dst/log/c.log"
+    out=$("$EXTMV" "$src" "$dst")
+    [[ "$out" == "File c.log already exists in $dst/log" ]] \
+        && ok "EXDEV: collision reported" || no "EXDEV: collision reported (got: $out)"
+    [[ "$(cat "$dst/log/c.log")" == keep && "$(cat "$src/c.log")" == new ]] \
+        && ok "EXDEV: collision leaves both files" || no "EXDEV: collision leaves both files"
+
+    # Same-filesystem move on the other filesystem (exercises its rename).
+    mkdir -p "$dst/same"; touch "$dst/same/s.md"
+    "$EXTMV" "$dst/same" "$dst/same/out" >/dev/null
+    assert_file "$dst/same/out/md/s.md" "other fs: same-filesystem move"
 
     # Cross-fs move from a source whose files can't be deleted: refused
     # without leaving a copy behind, so a rerun doesn't report "already exists".
@@ -154,25 +184,35 @@ if [[ -n "$otherfs" ]]; then
 
     # Interrupt a cross-fs copy. Whenever the signal lands, the real name must
     # be absent or complete -- never truncated -- and the data must survive.
-    # (512 MiB so the copy is usually still running when the signal lands.)
-    src="$work/xdev-int"
-    mkdir -p "$src"
-    head -c 536870912 /dev/urandom > "$src/big.bin"
-    sum=$(cksum < "$src/big.bin")
-    "$EXTMV" "$src" "$dst" >/dev/null 2>&1 &
-    pid=$!
-    sleep 0.05
-    # TERM, not INT: non-interactive bash starts background jobs ignoring SIGINT.
-    kill -TERM "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    if [[ -e "$dst/bin/big.bin" ]]; then
-        [[ "$(cksum < "$dst/bin/big.bin")" == "$sum" ]] \
-            && ok "EXDEV interrupted: destination complete" \
-            || no "EXDEV interrupted: destination truncated"
+    # The signal is sent once the temporary file appears, so it usually lands
+    # mid-copy. 512 MiB keeps the copy running long enough; opt-in because of
+    # the size.
+    if [[ "${EXTMV_HEAVY_TESTS:-}" == 1 ]]; then
+        src="$work/xdev-int"
+        mkdir -p "$src"
+        head -c 536870912 /dev/urandom > "$src/big.bin"
+        sum=$(cksum < "$src/big.bin")
+        "$EXTMV" "$src" "$dst" >/dev/null 2>&1 &
+        pid=$!
+        for _ in $(seq 500); do
+            compgen -G "$dst/bin/.extmv-*.tmp" >/dev/null && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.01
+        done
+        # TERM, not INT: non-interactive bash starts background jobs ignoring SIGINT.
+        kill -TERM "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        if [[ -e "$dst/bin/big.bin" ]]; then
+            [[ "$(cksum < "$dst/bin/big.bin")" == "$sum" ]] \
+                && ok "EXDEV interrupted: destination complete" \
+                || no "EXDEV interrupted: destination truncated"
+        else
+            [[ "$(cksum < "$src/big.bin" 2>/dev/null)" == "$sum" ]] \
+                && ok "EXDEV interrupted: no destination, source intact" \
+                || no "EXDEV interrupted: no destination and source damaged"
+        fi
     else
-        [[ "$(cksum < "$src/big.bin" 2>/dev/null)" == "$sum" ]] \
-            && ok "EXDEV interrupted: no destination, source intact" \
-            || no "EXDEV interrupted: no destination and source damaged"
+        skip "EXDEV interrupted copy (set EXTMV_HEAVY_TESTS=1)"
     fi
     rm -rf "$dst"
 else
