@@ -45,8 +45,10 @@ Differences from the C version: files are processed in sorted order, empty
 path arguments are rejected, `--` ends options, and the move itself is
 no-clobber (`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)`
 on macOS, `link` + `unlink` where those are unsupported), so a file that
-appears at the destination mid-run is never overwritten. On a filesystem that
-supports neither, the move fails with an error instead.
+appears at the destination mid-run is never overwritten. Filesystems that
+support neither (exFAT and FAT on macOS, i.e. most USB drives and SD cards)
+fall back to check-then-rename, where a file created at the destination in
+the instant between the check and the rename would be overwritten.
 
 ## Build and test
 
@@ -55,3 +57,7 @@ cargo build --release
 cargo test                         # unit tests + tests/run.sh
 ./tests/run.sh target/release/extmv
 ```
+
+`EXTMV_OTHERFS=<dir>` points the cross-filesystem cases at a directory on
+another filesystem, and `EXTMV_HEAVY_TESTS=1` adds a 512 MiB interrupted-copy
+case. CI sets both (macOS uses an exFAT RAM disk).

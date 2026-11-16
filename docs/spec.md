@@ -1,12 +1,15 @@
 # extmv — Behavioral Specification
 
-Version: 1.2 (2026-10-15). 1.0 was derived from `vacuum.c` (C17, repo
+Version: 1.3 (2026-11-16). 1.0 was derived from `vacuum.c` (C17, repo
 `mikemadden42/vacuum`) at commit `1988a1a`. 1.1 recorded the choices this Rust
 implementation made where 1.0 left room (`--`, sort order, no-clobber moves,
 SIGPIPE), the hardened cross-filesystem move (§3.6), and the test suite (§7).
 1.2: a cross-filesystem move whose source can't be deleted no longer leaves a
 second copy (§3.6); stdout is line-buffered so it stays in order with stderr
 (§3.7, §4); help output reports write failures (§2.1, §3.7).
+1.3 (2026-11-16): filesystems with neither a no-clobber rename nor hard links
+(exFAT/FAT on macOS) fall back to check-then-rename instead of failing every
+move (§3.5).
 
 `extmv` is the new name for this tool. The C reference implementation is still
 called `vacuum`; mentions of `vacuum` or "the C version" below refer to it.
@@ -198,8 +201,12 @@ overwritten**. 1.0 said a port SHOULD close that race; extmv does:
   `EOPNOTSUPP`), or on other systems: `link(src, dst)` then `unlink(src)`.
   `link` fails with `EEXIST` atomically. If the `unlink` fails, the new link
   is removed again (same inode, nothing lost) and the move fails.
-- A filesystem that supports neither (no hard links either) makes the move
-  **fail with an error**. extmv never falls back to a plain `rename`.
+- If `link` fails because the filesystem has no hard links (`EPERM`,
+  `EMLINK`, `ENOTSUP`, `EOPNOTSUPP`; e.g. exFAT/FAT on macOS, which also lack
+  `RENAME_EXCL`): `lstat(dst)`, and only if it is absent, plain `rename`.
+  A file created at `dest_path` between the two is overwritten. This is the
+  C version's race, accepted only here: refusing (1.2) made extmv fail every
+  move to or on most removable drives under macOS. **(extmv)**
 
 Step 2 stays: it is what produces the message in the common case without
 attempting a move.
@@ -229,6 +236,8 @@ the backstop. **(extmv)**
    mode `0600`), named `.extmv-<pid>-<n>.tmp`, where `n` counts up past names
    left by earlier runs. The name doesn't include the file's own name, which
    could push it past `NAME_MAX`. It is hidden, so a later run skips it.
+   If 100 names are all taken, the move fails with reason
+   `no free temporary file name` (not as a collision).
 3. **Set its mode** to the source permission bits `& 0777` with `fchmod`, so
    umask doesn't alter them. setuid/setgid/sticky are dropped on purpose.
    **(extmv)** In the C version umask still applies, so a `0666` source can
@@ -244,7 +253,8 @@ the backstop. **(extmv)**
 8. **fsync `dest_dir`**, so the new directory entry is durable before the
    source goes away. A filesystem that can't sync directories (`EINVAL`,
    `ENOTSUP`, …) is tolerated. Any other failure removes `dest_path` again
-   and fails the move, leaving the source intact.
+   (if it still has the copy's device and inode) and fails the move, leaving
+   the source intact.
 9. **Delete the source**, but only if `src_path` still has the device and
    inode that were copied (`lstat`). If it doesn't, keep both and fail with
    `source changed during move`. A replacement made between this check and
@@ -337,7 +347,8 @@ Exit codes: `0` success, `1` any failure. (The test script uses `2` for
    lets another user redirect files by planting a symlink at a bucket path.
 4. **No overwrite, ever.** Many standard-library "move" helpers overwrite
    (Rust `fs::rename`, Go `os.Rename`, Python `os.rename` on POSIX,
-   `shutil.move`). See §3.5 for the no-clobber rename.
+   `shutil.move`). See §3.5 for the no-clobber rename, and its one narrow
+   exception on filesystems with neither `RENAME_EXCL` nor hard links.
 5. **Detect EXDEV specifically** (Rust `ErrorKind::CrossesDevices`, Go
    `errors.Is(err, syscall.EXDEV)`, Python `e.errno == errno.EXDEV`). Don't
    fall back to copying on other errors.
@@ -411,31 +422,41 @@ parts the shell can't reach (§7.3).
 | Default run where `./Documents` already exists           | files go into it; `Documents` itself is not moved          |
 | `a.txt` + `b.txt` with `Documents/txt/b.txt` existing    | stdout exactly `Moved a.txt …` then `File b.txt already exists …` (sorted) |
 | Cross-fs, `0666` source under `umask 022`                | arrives as `0666` (§3.6 step 3)                            |
-| Cross-fs, 512 MiB file, SIGTERM mid-copy                 | `dest_path` absent (source intact) or complete; never truncated |
+| Cross-fs, `dest_path` already exists                     | `already exists` line; both files unchanged                |
+| Same-fs move on the second filesystem                    | moved (exercises its rename; on exFAT/FAT the fallback)    |
+| Cross-fs, 512 MiB file, SIGTERM mid-copy (opt-in)        | `dest_path` absent (source intact) or complete; never truncated |
 | `a.md`, `b.txt`, `c.md` with `Documents/txt` a file, `2>&1` | `Moved a.md …`, then `cannot create …`, then `Moved c.md …` (in order) |
 
 The interrupt case can't fail because of timing: whenever the signal lands,
-the result must be one of the two allowed states. The file is large so the
-signal usually lands mid-copy; against a binary that writes straight to
-`dest_path` (the C approach), the test fails.
+the result must be one of the two allowed states. The signal is sent once the
+temporary file appears and the file is large, so it usually lands mid-copy;
+against a binary that writes straight to `dest_path` (the C approach), the
+test fails. It runs only with `EXTMV_HEAVY_TESTS=1`.
+
+The cross-filesystem permission checks skip when the second filesystem
+doesn't keep mode bits (exFAT/FAT).
 
 Cases skip themselves where they can't run: the cross-filesystem cases when no
-writable directory on a second filesystem is found (`/dev/shm`,
-`/run/user/<uid>`, `/Volumes/RAMDisk`, `$TMPDIR`), the non-UTF-8 name on
-filesystems that reject it (APFS), `/dev/full` where it doesn't exist, and
-the read-only cases when run as root. On macOS CI the first three skip.
+writable directory on a second filesystem is found (`$EXTMV_OTHERFS`,
+`/dev/shm`, `/run/user/<uid>`, `/Volumes/RAMDisk`, `$TMPDIR`), the non-UTF-8
+name on filesystems that reject it (APFS), `/dev/full` where it doesn't
+exist, and the read-only cases when run as root. macOS CI provides an exFAT
+RAM disk as `$EXTMV_OTHERFS`, so only the last two kinds skip there.
 
 ### 7.3 Unit tests
 
 Cases that need a race or a contrived file type the shell can't arrange
 reliably are tested by calling the internals directly: argument parsing
 (§2.1), the extension and join rules (§3.3, §3.4), the link-then-unlink
-fallback (moves; refuses an existing destination), the source-deletable check
+fallback (moves; refuses an existing destination), the check-then-rename
+fallback (moves; refuses an existing destination, even a dangling symlink),
+temporary-name exhaustion (not reported as a collision), the source-deletable check
 (rejects a read-only directory), and the copy (exact mode despite umask,
 refuses a symlink or FIFO source without blocking, leaves no temporary behind,
 refuses an existing destination and cleans up, skips stale temporary names,
 and undoes itself when the source can't be deleted — called directly, so the
-up-front check doesn't stop it first).
+up-front check doesn't stop it first). Filesystem unit tests share a lock, so
+the one that changes the process-wide umask can't affect the others.
 
 Not covered by any test: a source replaced mid-copy (§3.6 step 9), a copy
 failing partway (e.g. `ENOSPC`), a failed directory fsync, and the

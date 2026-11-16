@@ -43,5 +43,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-targets
+      # macOS runners have no second filesystem, so the cross-filesystem
+      # cases would skip. An exFAT RAM disk provides one and also exercises
+      # the check-then-rename fallback (no RENAME_EXCL, no hard links).
+      - name: Create exFAT RAM disk
+        if: runner.os == 'macOS'
+        run: |
+          dev=$(hdiutil attach -nomount ram://2457600 | awk '{print $1}')
+          diskutil erasevolume ExFAT EXTMVT "$dev"
+          echo "EXTMV_OTHERFS=/Volumes/EXTMVT" >> "$GITHUB_ENV"
       # Includes tests/run.sh via tests/conformance.rs.
       - run: cargo test --locked
+        env:
+          EXTMV_HEAVY_TESTS: 1
+
+  msrv:
+    name: build (MSRV 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-targets
